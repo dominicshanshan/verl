@@ -37,6 +37,10 @@ class QATConfig(BaseConfig):
     ignore_patterns: list[str] = field(default_factory=lambda: ["lm_head", "embed_tokens", "re:.*mlp.gate$"])
     activation_observer: str = "static_minmax"
     quantization_config_path: Optional[str] = None
+    # "triton" (default) uses verl's in-tree Triton FP4 kernel; "te" routes
+    # through Transformer Engine's fused nvte_group_nvfp4_quantize. Overridden
+    # at runtime by the VERL_QAT_BACKEND env var when set.
+    quant_backend: str = "triton"
 
 
 def load_quantization_config(qat_config: QATConfig) -> dict[str, Any]:
@@ -118,6 +122,7 @@ def apply_qat(
             mode=mode,
             group_size=config.group_size,
             activation_observer=config.activation_observer,
+            quant_backend=config.quant_backend,
         )
 
         _set_module(model, name, fake_quant_module)

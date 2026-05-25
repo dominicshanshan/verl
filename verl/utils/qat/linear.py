@@ -24,6 +24,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from verl.utils.qat.te_fp4 import STEFP4QuantTE, select_qat_backend
+
 __all__ = ["QATLinear", "QATMode"]
 
 
@@ -207,12 +209,14 @@ class QATLinear(nn.Linear):
         activation_observer: str = "static_minmax",  # Observer strategy for activation global_scale
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
+        quant_backend: str = "triton",
     ):
         super().__init__(in_features, out_features, bias, device=device, dtype=dtype)
 
         self.mode = mode
         self.group_size = group_size
         self.activation_observer = activation_observer
+        self.quant_backend = select_qat_backend(default=quant_backend)
 
         self._weight_blockwise_scale: Optional[torch.Tensor] = None
         self._weight_global_scale: Optional[torch.Tensor] = None
@@ -239,6 +243,7 @@ class QATLinear(nn.Linear):
         mode: QATMode = QATMode.W4A4,
         group_size: int = 16,
         activation_observer: str = "static_minmax",
+        quant_backend: str = "triton",
     ) -> "QATLinear":
         """Create QATLinear from an existing nn.Linear."""
         has_bias = linear.bias is not None
@@ -252,6 +257,7 @@ class QATLinear(nn.Linear):
             activation_observer=activation_observer,
             device=linear.weight.device,
             dtype=linear.weight.dtype,
+            quant_backend=quant_backend,
         )
 
         if linear.weight.device != torch.device("meta"):
@@ -340,7 +346,8 @@ class QATLinear(nn.Linear):
             if self._weight_global_scale is None:
                 self._weight_global_scale = global_amax.float() / (FP4_E2M1_MAX * FP8_E4M3_MAX)
 
-        result = STEFP4QuantTriton.apply(weight, global_amax, self.group_size)
+        quant_fn = STEFP4QuantTE if self.quant_backend == "te" else STEFP4QuantTriton
+        result = quant_fn.apply(weight, global_amax, self.group_size)
 
         return result
 
@@ -360,7 +367,8 @@ class QATLinear(nn.Linear):
             raise RuntimeError("W4A4 input_global_scale uninitialized. Load PTQ model first.")
 
         global_amax = (FP4_E2M1_MAX * FP8_E4M3_MAX) / self.input_global_scale.to(x.device)
-        result = STEFP4QuantTriton.apply(x_2d, global_amax, self.group_size)
+        quant_fn = STEFP4QuantTE if self.quant_backend == "te" else STEFP4QuantTriton
+        result = quant_fn.apply(x_2d, global_amax, self.group_size)
         return result.view(original_shape)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -381,5 +389,6 @@ class QATLinear(nn.Linear):
         return (
             f"in_features={self.in_features}, out_features={self.out_features}, "
             f"bias={self.bias is not None}, mode={self.mode.value}, "
-            f"group_size={self.group_size}, fake_quant_enabled={self.fake_quant_enabled}"
+            f"group_size={self.group_size}, fake_quant_enabled={self.fake_quant_enabled}, "
+            f"quant_backend={self.quant_backend}"
         )

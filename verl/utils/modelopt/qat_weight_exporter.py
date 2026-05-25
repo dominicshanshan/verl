@@ -30,6 +30,11 @@ from modelopt.torch.export.quant_utils import (
 from modelopt.torch.quantization.qtensor.nvfp4_tensor import NVFP4QTensor
 
 from verl.utils.megatron_utils import unwrap_model
+from verl.utils.qat.te_fp4 import (
+    is_te_nvfp4_available,
+    te_fp4_real_quant,
+    te_fp4_real_quant_grouped,
+)
 
 # NVFP4 two-level scaling denominator: FP4_MAX (6.0) * FP8_MAX (448.0).
 _NVFP4_AMAX_DENOMINATOR = 6.0 * 448.0
@@ -54,9 +59,18 @@ class QATWeightExporter:
         actor_module: list,
         bridge: Any,
         qat_mode: str = "w4a16",
+        quant_backend: str = "modelopt",
     ):
         self.qat_mode = qat_mode
         self._actor_module = actor_module
+        if quant_backend not in ("modelopt", "te"):
+            raise ValueError(f"quant_backend must be 'modelopt' or 'te', got {quant_backend!r}")
+        if quant_backend == "te" and not is_te_nvfp4_available():
+            raise RuntimeError(
+                "QATWeightExporter(quant_backend='te') requires a Transformer Engine build "
+                "that exposes NVFP4Quantizer; install a recent TE or use 'modelopt'."
+            )
+        self.quant_backend = quant_backend
 
         self._registry = self._get_mapping_registry(bridge)
 
@@ -90,16 +104,60 @@ class QATWeightExporter:
         For each ``(hf_name, bf16_weight)`` from the iterator, yields the
         quantized weight plus its scaling factors when the parameter is
         quantized, or the original tensor unchanged otherwise.
+
+        With ``quant_backend='te'`` and a layer-index in the HF name we buffer
+        per-layer weights and call ``te_fp4_real_quant_grouped`` once per
+        layer to amortize the fused-kernel launch.
         """
+        if self.quant_backend != "te":
+            for hf_name, weight in per_tensor_param:
+                if "_quantizer." in hf_name:
+                    continue
+                meta = self._resolve_quant_metadata(hf_name)
+                if meta is None:
+                    yield (hf_name, weight)
+                else:
+                    assert meta.qformat == QUANTIZATION_NVFP4, f"Unsupported qformat: {meta.qformat}"
+                    yield from self._quantize_nvfp4(hf_name, weight, meta)
+            return
+
+        yield from self._iter_grouped_te(per_tensor_param)
+
+    def _iter_grouped_te(
+        self,
+        per_tensor_param: Iterator[tuple[str, torch.Tensor]],
+    ) -> Iterator[tuple[str, torch.Tensor]]:
+        """Buffer per-layer quantizable weights and quantize them in groups."""
+        current_layer: Optional[str] = None
+        buf_names: list[str] = []
+        buf_weights: list[torch.Tensor] = []
+        buf_metas: list[_QuantMeta] = []
+
+        def _flush() -> Iterator[tuple[str, torch.Tensor]]:
+            if not buf_weights:
+                return
+            yield from self._quantize_nvfp4_grouped(buf_names, buf_weights, buf_metas)
+            buf_names.clear()
+            buf_weights.clear()
+            buf_metas.clear()
+
         for hf_name, weight in per_tensor_param:
             if "_quantizer." in hf_name:
                 continue
             meta = self._resolve_quant_metadata(hf_name)
+            layer = _extract_layer_key(hf_name)
+            if layer != current_layer:
+                yield from _flush()
+                current_layer = layer
             if meta is None:
                 yield (hf_name, weight)
-            else:
-                assert meta.qformat == QUANTIZATION_NVFP4, f"Unsupported qformat: {meta.qformat}"
-                yield from self._quantize_nvfp4(hf_name, weight, meta)
+                continue
+            assert meta.qformat == QUANTIZATION_NVFP4, f"Unsupported qformat: {meta.qformat}"
+            buf_names.append(hf_name)
+            buf_weights.append(weight)
+            buf_metas.append(meta)
+
+        yield from _flush()
 
     @staticmethod
     def _get_mapping_registry(bridge):
@@ -214,15 +272,17 @@ class QATWeightExporter:
           ``(input_scale, activation_scale)`` -- only when available
         """
         w_amax = meta.weight_amax.to(weight.device)
-        w_scale_2 = w_amax.float() / _NVFP4_AMAX_DENOMINATOR
 
-        w_scale = NVFP4QTensor.get_weights_scaling_factor(
-            weight,
-            meta.block_size,
-            weights_scaling_factor_2=w_scale_2.to(weight.device),
-        )[0]
-
-        quantized = to_quantized_weight(weight, w_scale, meta.qformat, w_scale_2, meta.block_size)
+        if self.quant_backend == "te":
+            quantized, w_scale, w_scale_2 = te_fp4_real_quant(weight, global_amax=w_amax, block_size=meta.block_size)
+        else:
+            w_scale_2 = w_amax.float() / _NVFP4_AMAX_DENOMINATOR
+            w_scale = NVFP4QTensor.get_weights_scaling_factor(
+                weight,
+                meta.block_size,
+                weights_scaling_factor_2=w_scale_2.to(weight.device),
+            )[0]
+            quantized = to_quantized_weight(weight, w_scale, meta.qformat, w_scale_2, meta.block_size)
 
         yield (name, quantized)
         yield (_derive_scale_name(name, "weight_scale"), w_scale)
@@ -231,6 +291,31 @@ class QATWeightExporter:
         input_scale = _compute_input_scale(meta)
         if input_scale is not None:
             yield (_derive_scale_name(name, "input_scale"), input_scale)
+
+    def _quantize_nvfp4_grouped(
+        self,
+        names: list[str],
+        weights: list[torch.Tensor],
+        metas: list[_QuantMeta],
+    ) -> Iterator[tuple[str, torch.Tensor]]:
+        """Grouped TE-backed NVFP4 quantize for a layer's worth of weights."""
+        amaxes = [m.weight_amax.to(w.device) for m, w in zip(metas, weights, strict=True)]
+        block_sizes = {m.block_size for m in metas}
+        if len(block_sizes) != 1:
+            # Mixed block sizes inside a single layer are rare; fall back per-tensor.
+            for name, weight, meta in zip(names, weights, metas, strict=True):
+                yield from self._quantize_nvfp4(name, weight, meta)
+            return
+
+        block_size = block_sizes.pop()
+        outputs = te_fp4_real_quant_grouped(weights, amaxes, block_size=block_size)
+        for name, meta, (quantized, w_scale, w_scale_2) in zip(names, metas, outputs, strict=True):
+            yield (name, quantized)
+            yield (_derive_scale_name(name, "weight_scale"), w_scale)
+            yield (_derive_scale_name(name, "weight_scale_2"), w_scale_2)
+            input_scale = _compute_input_scale(meta)
+            if input_scale is not None:
+                yield (_derive_scale_name(name, "input_scale"), input_scale)
 
 
 def _iter_hf_to_megatron_matches(registry, hf_name: str):
@@ -260,6 +345,15 @@ def _iter_hf_to_megatron_matches(registry, hf_name: str):
 def _derive_scale_name(weight_name: str, suffix: str) -> str:
     result = weight_name.replace(".weight", f".{suffix}")
     return result if result != weight_name else f"{weight_name}_{suffix}"
+
+
+_LAYER_KEY_RE = re.compile(r"(?:layers|local_experts)\.(\d+)")
+
+
+def _extract_layer_key(hf_name: str) -> Optional[str]:
+    """Return a stable grouping key (``layers.<idx>`` / ``local_experts.<idx>``)."""
+    m = _LAYER_KEY_RE.search(hf_name)
+    return m.group(0) if m else None
 
 
 def _compute_input_scale(meta: _QuantMeta) -> Optional[torch.Tensor]:
